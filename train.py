@@ -5,7 +5,8 @@ import argparse
 import numpy as np
 import os
 from pathlib import Path
-from gcn_model import MultiLayerGCN
+from gcn import MultiLayerGCN
+from gat import MultiLayerGAT
 from data_processor import GraphDataProcessor
 from torch_geometric.data import Data, Batch
 
@@ -22,7 +23,7 @@ def split_data(graphs, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42
     Returns:
         tuple: (train_graphs, val_graphs, test_graphs)
     """
-    assert train_ratio + val_ratio + test_ratio == 1.0, 
+    assert train_ratio + val_ratio + test_ratio == 1.0, "Ratios must sum to 1.0"
     
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -46,7 +47,7 @@ def split_data(graphs, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42
     
     return train_graphs, val_graphs, test_graphs
 
-def save_checkpoint(model, optimizer, epoch, train_graphs, val_graphs, test_graphs, args, checkpoint_dir='checkpoints'):
+def save_checkpoint(model, optimizer, epoch, train_graphs, val_graphs, test_graphs, args, checkpoint_dir='checkpoints', verbose=True):
     # Create checkpoint directory if it doesn't exist
     os.makedirs(checkpoint_dir, exist_ok=True)
     
@@ -62,7 +63,8 @@ def save_checkpoint(model, optimizer, epoch, train_graphs, val_graphs, test_grap
     
     checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch}.pt')
     torch.save(checkpoint, checkpoint_path)
-    print(f"Saved checkpoint to {checkpoint_path}")
+    if verbose:
+        print(f"Saved checkpoint to {checkpoint_path}")
 
 def load_checkpoint(checkpoint_path, model, optimizer):
     checkpoint = torch.load(checkpoint_path)
@@ -76,11 +78,21 @@ def get_device():
     return torch.device('cpu')
 
 def convert_to_pyg_data(graph_dict, device):
-    """Convert a single graph dictionary to PyG Data object."""
-    x = torch.tensor(graph_dict['node_features'], dtype=torch.float).to(device)
+    # Convert node features - handle both node_feat and node_features keys
+    if 'node_feat' in graph_dict:
+        x = torch.tensor(graph_dict['node_feat'], dtype=torch.float).to(device)
+    else:
+        x = torch.tensor(graph_dict['node_features'], dtype=torch.float).to(device)
+    
     edge_index = torch.tensor(graph_dict['edge_index'], dtype=torch.long).to(device)
     y = torch.tensor(graph_dict['y'], dtype=torch.float).view(-1).to(device)
-    return Data(x=x, edge_index=edge_index, y=y)
+    
+    # Handle edge attributes
+    if 'edge_attr' in graph_dict:
+        edge_attr = torch.tensor(graph_dict['edge_attr'], dtype=torch.float).to(device)
+        return Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y)
+    else:
+        return Data(x=x, edge_index=edge_index, y=y)
 
 def train_model(model, train_graphs, val_graphs, test_graphs, optimizer, args):
     """
@@ -116,23 +128,40 @@ def train_model(model, train_graphs, val_graphs, test_graphs, optimizer, args):
         for epoch in range(start_epoch, args.epochs):
             model.train()
             total_train_loss = 0
-            for graph_dict in train_graphs:
-                data = convert_to_pyg_data(graph_dict, device)
+            
+            # Process graphs in batches
+            for i in range(0, len(train_graphs), args.batch_size):
+                batch_graphs = train_graphs[i:i + args.batch_size]
+                batch_data = [convert_to_pyg_data(g, device) for g in batch_graphs]
+                batch = Batch.from_data_list(batch_data)
+                
                 optimizer.zero_grad()
-                out = model(data.x, data.edge_index)
-                loss = F.mse_loss(out.squeeze(), data.y)
+                # Pass edge_attr if it exists
+                if hasattr(batch, 'edge_attr'):
+                    out = model(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
+                else:
+                    out = model(batch.x, batch.edge_index, batch=batch.batch)
+                loss = F.mse_loss(out.squeeze(), batch.y)
                 loss.backward()
                 optimizer.step()
-                total_train_loss += loss.item()
+                total_train_loss += loss.item() * len(batch_graphs)
             
             model.eval()
             total_val_loss = 0
             with torch.no_grad():
-                for graph_dict in val_graphs:
-                    data = convert_to_pyg_data(graph_dict, device)
-                    out = model(data.x, data.edge_index)
-                    val_loss = F.mse_loss(out.squeeze(), data.y)
-                    total_val_loss += val_loss.item()
+                # Process validation graphs in batches
+                for i in range(0, len(val_graphs), args.batch_size):
+                    batch_graphs = val_graphs[i:i + args.batch_size]
+                    batch_data = [convert_to_pyg_data(g, device) for g in batch_graphs]
+                    batch = Batch.from_data_list(batch_data)
+                    
+                    # Pass edge_attr if it exists
+                    if hasattr(batch, 'edge_attr'):
+                        out = model(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
+                    else:
+                        out = model(batch.x, batch.edge_index, batch=batch.batch)
+                    val_loss = F.mse_loss(out.squeeze(), batch.y)
+                    total_val_loss += val_loss.item() * len(batch_graphs)
             
             avg_train_loss = total_train_loss / len(train_graphs)
             avg_val_loss = total_val_loss / len(val_graphs)
@@ -141,15 +170,18 @@ def train_model(model, train_graphs, val_graphs, test_graphs, optimizer, args):
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
                 best_model_state = model.state_dict().copy()
-                # Save best model checkpoint
-                save_checkpoint(model, optimizer, epoch, train_graphs, val_graphs, test_graphs, args)
+                # Save best model checkpoint without printing
+                save_checkpoint(model, optimizer, epoch, train_graphs, val_graphs, test_graphs, args, verbose=False)
             
             # Save periodic checkpoint
             if (epoch + 1) % args.save_every == 0:
-                save_checkpoint(model, optimizer, epoch, train_graphs, val_graphs, test_graphs, args)
+                save_checkpoint(model, optimizer, epoch, train_graphs, val_graphs, test_graphs, args, verbose=True)
             
-            if (epoch + 1) % 10 == 0:
+            # Print training progress
+            if (epoch + 1) % args.print_every == 0:
                 print(f'Epoch {epoch+1:03d}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}')
+
+            
         
     except KeyboardInterrupt:
         print("\nTraining interrupted by user. Saving checkpoint...")
@@ -199,13 +231,22 @@ def main(args):
     
     # Initialize model
     print("Initializing model...")
-    model = MultiLayerGCN(
-        in_channels=input_dim,
-        hidden_channels=args.hidden_size,
-        out_channels=1,  # For regression
-        num_layers=args.num_layers,
-        dropout=args.dropout
-    )
+    if args.model == 'gcn':
+        model = MultiLayerGCN(
+            in_channels=input_dim,
+            hidden_channels=args.hidden_size,
+            out_channels=1,  # For regression
+            num_layers=args.num_layers,
+            dropout=args.dropout
+        )
+    elif args.model == 'gat':
+        model = MultiLayerGAT(
+            in_channels=input_dim,
+            hidden_channels=args.hidden_size,
+            out_channels=1,  # For regression
+            num_layers=args.num_layers,
+            dropout=args.dropout
+        )
     
     # Initialize optimizer
     optimizer = torch.optim.Adam(
@@ -219,11 +260,13 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument('--model', type=str, choices=['gcn', 'gat'], help='Model to use')
     parser.add_argument('data_path', type=str, help='Path to the input data file')
     parser.add_argument('--hidden-size', type=int, default=64, help='Hidden layer size')
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
     parser.add_argument('--weight-decay', type=float, default=5e-4, help='Weight decay')
     parser.add_argument('--epochs', type=int, default=200, help='Number of training epochs')
+    parser.add_argument('--batch-size', type=int, default=64, help='Training graphs per batch')
     parser.add_argument('--train-ratio', type=float, default=0.7, help='Ratio of training data')
     parser.add_argument('--val-ratio', type=float, default=0.15, help='Ratio of validation data')
     parser.add_argument('--test-ratio', type=float, default=0.15, help='Ratio of test data')
@@ -231,6 +274,7 @@ if __name__ == "__main__":
     parser.add_argument('--num-layers', type=int, default=2, help='Number of GCN layers')
     parser.add_argument('--dropout', type=float, default=0.0, help='Dropout probability')
     parser.add_argument('--save-every', type=int, default=10, help='Save checkpoint every N epochs')
+    parser.add_argument('--print-every', type=int, default=10, help='Print training progress every N epochs')
     parser.add_argument('--resume', type=str, help='Path to checkpoint to resume from')
     parser.add_argument('--device', type=str, choices=['cpu', 'cuda'], help='Device to use for training')
     
@@ -238,21 +282,17 @@ if __name__ == "__main__":
     main(args)
 
 # def example_usage():
-#     """Example of how to use the GCN model with dictionary input."""
-#     # Example dictionary input
 #     sample_data = {
 #         'node_features': [[1, 2, 3], [4, 5, 6], [7, 8, 9]],  # 3 nodes with 3 features each
 #         'edge_index': [[0, 1, 1, 2], [1, 0, 2, 1]],  # Bidirectional edges between nodes
 #         'y': [0, 1, 2]  # Node labels
 #     }
     
-#     # Initialize data processor
 #     processor = GraphDataProcessor(normalize_features=True)
     
 #     # Convert dictionary to PyG Data object
 #     graph_data = processor.process_dict_to_graph(sample_data)
     
-#     # Create model (3 input features, 16 hidden features, 3 output classes)
 #     model = TwoLayerGCN(
 #         in_channels=3,
 #         hidden_channels=16,
