@@ -125,4 +125,5 @@ coverage.xml
 
 # Project files
 convert_esol.py
-example_data/
+example_data.json
+Datasets/

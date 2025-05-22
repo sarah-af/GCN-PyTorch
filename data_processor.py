@@ -66,7 +66,6 @@ class GraphDataProcessor:
     
     def process_batch(self, dict_list):
         """
-        Process a list of dictionaries into a list of PyG Data objects.
         
         Args:
             dict_list (list): List of dictionaries containing graph information

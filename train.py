@@ -82,10 +82,29 @@ def convert_to_pyg_data(graph_dict, device):
     if 'node_feat' in graph_dict:
         x = torch.tensor(graph_dict['node_feat'], dtype=torch.float).to(device)
     else:
-        x = torch.tensor(graph_dict['node_features'], dtype=torch.float).to(device)
+        # Handle nested node features
+        node_features = graph_dict['node_features']
+        if isinstance(node_features[0][0], list):
+            # If features are nested, flatten one level
+            x = torch.tensor([feat[0] for feat in node_features], dtype=torch.float).to(device)
+        else:
+            x = torch.tensor(node_features, dtype=torch.float).to(device)
     
+    # Convert edge index to the correct format
     edge_index = torch.tensor(graph_dict['edge_index'], dtype=torch.long).to(device)
+    if edge_index.dim() == 1:
+        # If edge_index is a flat list, reshape it to [2, num_edges]
+        edge_index = edge_index.view(2, -1)
+    elif edge_index.dim() == 2 and edge_index.size(0) != 2:
+        # If edge_index is [num_edges, 2], transpose it to [2, num_edges]
+        edge_index = edge_index.t()
+    
     y = torch.tensor(graph_dict['y'], dtype=torch.float).view(-1).to(device)
+    
+    # Validate graph structure
+    num_nodes = x.size(0)
+    if edge_index.max() >= num_nodes:
+        raise ValueError(f"Edge index {edge_index.max()} is out of bounds for graph with {num_nodes} nodes")
     
     # Handle edge attributes
     if 'edge_attr' in graph_dict:
@@ -132,19 +151,23 @@ def train_model(model, train_graphs, val_graphs, test_graphs, optimizer, args):
             # Process graphs in batches
             for i in range(0, len(train_graphs), args.batch_size):
                 batch_graphs = train_graphs[i:i + args.batch_size]
-                batch_data = [convert_to_pyg_data(g, device) for g in batch_graphs]
-                batch = Batch.from_data_list(batch_data)
-                
-                optimizer.zero_grad()
-                # Pass edge_attr if it exists
-                if hasattr(batch, 'edge_attr'):
-                    out = model(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
-                else:
-                    out = model(batch.x, batch.edge_index, batch=batch.batch)
-                loss = F.mse_loss(out.squeeze(), batch.y)
-                loss.backward()
-                optimizer.step()
-                total_train_loss += loss.item() * len(batch_graphs)
+                try:
+                    batch_data = [convert_to_pyg_data(g, device) for g in batch_graphs]
+                    batch = Batch.from_data_list(batch_data)
+                    
+                    optimizer.zero_grad()
+                    # Only pass x, edge_index, and batch to the model
+                    out = model(batch.x, batch.edge_index, batch.batch)
+                    loss = F.mse_loss(out.squeeze(), batch.y)
+                    loss.backward()
+                    optimizer.step()
+                    total_train_loss += loss.item() * len(batch_graphs)
+                except Exception as e:
+                    print(f"Error processing batch starting at index {i}:")
+                    print(f"Error: {str(e)}")
+                    print("First graph in batch:")
+                    print(json.dumps(batch_graphs[0], indent=2))
+                    raise
             
             model.eval()
             total_val_loss = 0
@@ -155,11 +178,8 @@ def train_model(model, train_graphs, val_graphs, test_graphs, optimizer, args):
                     batch_data = [convert_to_pyg_data(g, device) for g in batch_graphs]
                     batch = Batch.from_data_list(batch_data)
                     
-                    # Pass edge_attr if it exists
-                    if hasattr(batch, 'edge_attr'):
-                        out = model(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
-                    else:
-                        out = model(batch.x, batch.edge_index, batch=batch.batch)
+                    # Only pass x, edge_index, and batch to the model
+                    out = model(batch.x, batch.edge_index, batch.batch)
                     val_loss = F.mse_loss(out.squeeze(), batch.y)
                     total_val_loss += val_loss.item() * len(batch_graphs)
             
@@ -180,9 +200,7 @@ def train_model(model, train_graphs, val_graphs, test_graphs, optimizer, args):
             # Print training progress
             if (epoch + 1) % args.print_every == 0:
                 print(f'Epoch {epoch+1:03d}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}')
-
             
-        
     except KeyboardInterrupt:
         print("\nTraining interrupted by user. Saving checkpoint...")
         save_checkpoint(model, optimizer, epoch, train_graphs, val_graphs, test_graphs, args)
@@ -198,8 +216,14 @@ def train_model(model, train_graphs, val_graphs, test_graphs, optimizer, args):
     with torch.no_grad():
         for graph_dict in test_graphs:
             data = convert_to_pyg_data(graph_dict, device)
-            out = model(data.x, data.edge_index)
-            test_loss = F.mse_loss(out.squeeze(), data.y)
+            out = model(data.x, data.edge_index, torch.zeros(data.x.size(0), dtype=torch.long, device=device))
+            # Ensure consistent shapes for loss calculation
+            out = out.squeeze()
+            if out.dim() == 0:
+                out = out.unsqueeze(0)  # Add batch dimension if needed
+            if data.y.dim() == 0:
+                data.y = data.y.unsqueeze(0)  # Add batch dimension if needed
+            test_loss = F.mse_loss(out, data.y)
             total_test_loss += test_loss.item()
     
     avg_test_loss = total_test_loss / len(test_graphs)
@@ -209,7 +233,7 @@ def main(args):
     # Load and process the data
     print("Loading data...")
     with open(args.data_path, 'r') as f:
-        graphs = json.load(f)
+        graphs = [json.loads(line) for line in f if line.strip()]
     
     # Split data into train/val/test sets
     print("Splitting data...")

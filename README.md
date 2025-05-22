@@ -70,7 +70,7 @@ python train.py path/to/your/data.json --resume checkpoints/checkpoint_epoch_X.p
 ## Data Format
 
 The input data should be a JSON file containing a list of graph dictionaries. Each graph dictionary should have the following format:
-JSONL files of a similar strucuture can be convered using conver_dataset.py
+JSONL files of a similar structure can be converted using convert_dataset.py
 
 ```python
 {
@@ -79,6 +79,8 @@ JSONL files of a similar strucuture can be convered using conver_dataset.py
     'y': [value]                          # Target value
 }
 ```
+
+For JSONL files, each line should be a separate JSON object with the same structure as above.
 
 ## License
 

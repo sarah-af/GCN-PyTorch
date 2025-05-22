@@ -3,7 +3,7 @@ import numpy as np
 import json
 import pandas as pd
 from pathlib import Path
-from gcn_model import TwoLayerGCN
+from gcn import TwoLayerGCN
 from data_processor import GraphDataProcessor
 from torch_geometric.data import Data
 
