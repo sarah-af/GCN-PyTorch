@@ -9,6 +9,7 @@ from gcn import MultiLayerGCN
 from gat import MultiLayerGAT
 from data_processor import GraphDataProcessor
 from torch_geometric.data import Data, Batch
+import math
 
 def split_data(graphs, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
     """
@@ -51,7 +52,8 @@ def save_checkpoint(model, optimizer, epoch, train_graphs, val_graphs, test_grap
     # Create checkpoint directory if it doesn't exist
     os.makedirs(checkpoint_dir, exist_ok=True)
     
-    checkpoint = {
+    # Save full checkpoint
+    full_checkpoint = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
@@ -61,16 +63,60 @@ def save_checkpoint(model, optimizer, epoch, train_graphs, val_graphs, test_grap
         'args': args
     }
     
-    checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch}.pt')
-    torch.save(checkpoint, checkpoint_path)
+    # Save weights-only checkpoint
+    weights_checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict()
+    }
+    
+    full_checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch}.pt')
+    weights_checkpoint_path = os.path.join(checkpoint_dir, f'weights_epoch_{epoch}.pt')
+    
+    torch.save(full_checkpoint, full_checkpoint_path)
+    torch.save(weights_checkpoint, weights_checkpoint_path)
+    
     if verbose:
-        print(f"Saved checkpoint to {checkpoint_path}")
+        print(f"Saved full checkpoint to {full_checkpoint_path}")
+        print(f"Saved weights-only checkpoint to {weights_checkpoint_path}")
 
-def load_checkpoint(checkpoint_path, model, optimizer):
-    checkpoint = torch.load(checkpoint_path)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    return checkpoint['epoch'], checkpoint['train_graphs'], checkpoint['val_graphs'], checkpoint['test_graphs']
+def load_checkpoint(checkpoint_path, model, optimizer=None):
+    """
+    Load checkpoint from file. If optimizer is None, only model weights will be loaded.
+    
+    Args:
+        checkpoint_path (str): Path to the checkpoint file
+        model (torch.nn.Module): Model to load weights into
+        optimizer (torch.optim.Optimizer, optional): Optimizer to load state into
+    
+    Returns:
+        tuple: (epoch, train_graphs, val_graphs, test_graphs) if full checkpoint,
+               (epoch,) if weights-only checkpoint
+    """
+    try:
+        # First try loading as full checkpoint
+        checkpoint = torch.load(checkpoint_path)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        
+        if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        if 'train_graphs' in checkpoint:
+            return checkpoint['epoch'], checkpoint['train_graphs'], checkpoint['val_graphs'], checkpoint['test_graphs']
+        else:
+            return checkpoint['epoch'],
+            
+    except Exception as e:
+        print(f"Error loading full checkpoint: {str(e)}")
+        print("Attempting to load weights-only checkpoint...")
+        
+        # Try loading as weights-only checkpoint
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            model.load_state_dict(checkpoint['model_state_dict'])
+            return checkpoint['epoch'],
+        except Exception as e:
+            print(f"Error loading weights-only checkpoint: {str(e)}")
+            raise
 
 def get_device():
     if torch.cuda.is_available():
@@ -78,6 +124,14 @@ def get_device():
     return torch.device('cpu')
 
 def convert_to_pyg_data(graph_dict, device):
+    # Add data validation
+    if 'node_features' not in graph_dict and 'node_feat' not in graph_dict:
+        raise ValueError("Missing both 'node_features' and 'node_feat' in graph dictionary")
+    if 'edge_index' not in graph_dict:
+        raise ValueError("Missing edge_index in graph dictionary")
+    if 'y' not in graph_dict:
+        raise ValueError("Missing y in graph dictionary")
+    
     # Convert node features - handle both node_feat and node_features keys
     if 'node_feat' in graph_dict:
         x = torch.tensor(graph_dict['node_feat'], dtype=torch.float).to(device)
@@ -109,8 +163,20 @@ def convert_to_pyg_data(graph_dict, device):
     # Handle edge attributes
     if 'edge_attr' in graph_dict:
         edge_attr = torch.tensor(graph_dict['edge_attr'], dtype=torch.float).to(device)
+        # Ensure edge_attr has the correct shape
+        if edge_attr.dim() == 1:
+            edge_attr = edge_attr.view(-1, 1)
+        
+        # Remove self-loops before creating the Data object
+        mask = edge_index[0] != edge_index[1]
+        edge_index = edge_index[:, mask]
+        edge_attr = edge_attr[mask]
+        
         return Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y)
     else:
+        # Remove self-loops even without edge attributes
+        mask = edge_index[0] != edge_index[1]
+        edge_index = edge_index[:, mask]
         return Data(x=x, edge_index=edge_index, y=y)
 
 def train_model(model, train_graphs, val_graphs, test_graphs, optimizer, args):
@@ -138,10 +204,19 @@ def train_model(model, train_graphs, val_graphs, test_graphs, optimizer, args):
     # Load checkpoint if specified
     if args.resume:
         print(f"Loading checkpoint from {args.resume}")
-        start_epoch, train_graphs, val_graphs, test_graphs = load_checkpoint(
-            args.resume, model, optimizer
-        )
-        print(f"Resuming from epoch {start_epoch}")
+        try:
+            # Try loading full checkpoint first
+            start_epoch, train_graphs, val_graphs, test_graphs = load_checkpoint(
+                args.resume, model, optimizer
+            )
+            print(f"Resuming from epoch {start_epoch}")
+        except Exception as e:
+            print(f"Could not load full checkpoint: {str(e)}")
+            print("Attempting to load weights-only checkpoint...")
+            # If full checkpoint fails, try loading weights only
+            start_epoch, = load_checkpoint(args.resume, model)
+            print(f"Loaded weights from epoch {start_epoch}")
+            print("Note: Training will continue with new data split")
     
     try:
         for epoch in range(start_epoch, args.epochs):
@@ -158,8 +233,34 @@ def train_model(model, train_graphs, val_graphs, test_graphs, optimizer, args):
                     optimizer.zero_grad()
                     # Only pass x, edge_index, and batch to the model
                     out = model(batch.x, batch.edge_index, batch.batch)
-                    loss = F.mse_loss(out.squeeze(), batch.y)
+                    
+                    # Check for NaN values in model output
+                    if torch.isnan(out).any():
+                        print(f"Warning: NaN values in model output at epoch {epoch}, batch {i}")
+                        print(f"Output shape: {out.shape}")
+                        print(f"Number of NaN values: {torch.isnan(out).sum().item()}")
+                        print("Input statistics:")
+                        print(f"x mean: {batch.x.mean().item()}, std: {batch.x.std().item()}")
+                        print(f"y mean: {batch.y.mean().item()}, std: {batch.y.std().item()}")
+                    
+                    # Ensure output and target have the same shape
+                    out = out.view(-1)  # Reshape to [batch_size]
+                    target = batch.y.view(-1)  # Reshape to [batch_size]
+                    loss = F.mse_loss(out, target)
+                    
+                    # Check for NaN loss
+                    if torch.isnan(loss):
+                        print(f"Warning: NaN loss at epoch {epoch}, batch {i}")
+                        print("Model parameters statistics:")
+                        for name, param in model.named_parameters():
+                            print(f"{name}: mean={param.mean().item()}, std={param.std().item()}")
+                        raise ValueError("NaN loss detected")
+                    
                     loss.backward()
+                    
+                    # Gradient clipping to prevent exploding gradients
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    
                     optimizer.step()
                     total_train_loss += loss.item() * len(batch_graphs)
                 except Exception as e:
@@ -176,11 +277,20 @@ def train_model(model, train_graphs, val_graphs, test_graphs, optimizer, args):
                 for i in range(0, len(val_graphs), args.batch_size):
                     batch_graphs = val_graphs[i:i + args.batch_size]
                     batch_data = [convert_to_pyg_data(g, device) for g in batch_graphs]
-                    batch = Batch.from_data_list(batch_data)
                     
+                    # Create proper batch indices
+                    batch = Batch.from_data_list(batch_data)
+                   
                     # Only pass x, edge_index, and batch to the model
                     out = model(batch.x, batch.edge_index, batch.batch)
-                    val_loss = F.mse_loss(out.squeeze(), batch.y)
+                
+                    
+                    # Ensure output and target have the same shape
+                    out = out.squeeze(-1)  # Remove last dimension if it's 1
+                    target = batch.y.view(-1)  # Reshape to [batch_size]
+                 
+                    
+                    val_loss = F.mse_loss(out, target)
                     total_val_loss += val_loss.item() * len(batch_graphs)
             
             avg_train_loss = total_train_loss / len(train_graphs)
@@ -235,6 +345,24 @@ def main(args):
     with open(args.data_path, 'r') as f:
         graphs = [json.loads(line) for line in f if line.strip()]
     
+    # Filter out samples with NaN target values
+    original_count = len(graphs)
+    graphs = [g for g in graphs if not (
+        isinstance(g['y'], list) and any(
+            isinstance(y, (int, float)) and math.isnan(y) for y in g['y']
+        )
+    ) and not (
+        isinstance(g['y'], (int, float)) and math.isnan(g['y'])
+    )]
+    filtered_count = len(graphs)
+    
+    if filtered_count < original_count:
+        print(f"Removed {original_count - filtered_count} samples with NaN target values")
+        print(f"Remaining samples: {filtered_count}")
+    
+    if filtered_count == 0:
+        raise ValueError("No valid samples remaining after filtering NaN values")
+    
     # Split data into train/val/test sets
     print("Splitting data...")
     train_graphs, val_graphs, test_graphs = split_data(
@@ -251,7 +379,12 @@ def main(args):
     print(f"Test graphs: {len(test_graphs)}")
     
     # Get input feature dimension from first graph
-    input_dim = len(graphs[0]['node_features'][0])
+    if 'node_features' in graphs[0]:
+        input_dim = len(graphs[0]['node_features'][0])
+    elif 'node_feat' in graphs[0]:
+        input_dim = len(graphs[0]['node_feat'][0])
+    else:
+        raise ValueError("Neither 'node_features' nor 'node_feat' found in graph data")
     
     # Initialize model
     print("Initializing model...")

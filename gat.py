@@ -1,5 +1,7 @@
 import torch
 from torch_geometric.nn import GATConv, global_mean_pool
+import torch.nn.functional as F
+from torch_scatter import scatter_mean
 
 class MultiLayerGAT(torch.nn.Module):
     """
@@ -13,26 +15,22 @@ class MultiLayerGAT(torch.nn.Module):
         num_layers (int): Number of GAT layers (default: 2)
         dropout (float): Dropout probability (default: 0.0)
     """
-    def __init__(self, in_channels, hidden_channels, out_channels, heads=2, edge_dim=None, num_layers=2, dropout=0.0):
+    def __init__(self, in_channels, hidden_channels, out_channels, num_layers=2, dropout=0.0):
         super().__init__()
+        self.layers = torch.nn.ModuleList()
         
         # Input layer
-        self.layers = torch.nn.ModuleList([
-            GATConv(in_channels, hidden_channels, heads=heads, edge_dim=edge_dim)
-        ])
+        self.layers.append(GATConv(in_channels, hidden_channels, add_self_loops=False))
         
         # Hidden layers
         for _ in range(num_layers - 2):
-            self.layers.append(GATConv(hidden_channels * heads, hidden_channels, heads=heads))
+            self.layers.append(GATConv(hidden_channels, hidden_channels, add_self_loops=False))
         
         # Output layer
-        self.layers.append(GATConv(hidden_channels * heads, hidden_channels, heads=1))  # Single head for output
+        self.layers.append(GATConv(hidden_channels, out_channels, add_self_loops=False))
         
-        # Final prediction layer
-        self.pred = torch.nn.Linear(hidden_channels, out_channels)
-        
-        self.dropout = torch.nn.Dropout(dropout)
-        
+        self.dropout = dropout
+    
     def forward(self, x, edge_index, edge_attr=None, batch=None):
         """
         
@@ -45,22 +43,29 @@ class MultiLayerGAT(torch.nn.Module):
         Returns:
             torch.Tensor: Graph-level predictions
         """
-        # Apply all layers except the last one with ReLU and dropout
-        for layer in self.layers[:-1]:
-            x = layer(x, edge_index, edge_attr)
-            x = torch.relu(x)
-            x = self.dropout(x)
-        
-        # Last layer
-        x = self.layers[-1](x, edge_index, edge_attr)
-        
-        # Global pooling to get graph-level representation
+        # If no batch is provided, create one
         if batch is None:
             batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
-        x = global_mean_pool(x, batch)
         
-        # Final prediction
-        x = self.pred(x)
+        print(f"Debug - Input x shape: {x.shape}")
+        print(f"Debug - Batch shape: {batch.shape}")
+        print(f"Debug - Batch unique values: {torch.unique(batch)}")
+        
+        for i, layer in enumerate(self.layers):
+            x = layer(x, edge_index, edge_attr)
+            print(f"Debug - After layer {i}, x shape: {x.shape}")
+            if i < len(self.layers) - 1:  # Don't apply dropout after last layer
+                x = F.relu(x)
+                x = F.dropout(x, p=self.dropout, training=self.training)
+        
+        # Global mean pooling to get one prediction per graph
+        x = scatter_mean(x, batch, dim=0)
+        print(f"Debug - After scatter_mean, x shape: {x.shape}")
+        
+        # Ensure output has shape [batch_size, 1]
+        if x.dim() == 1:
+            x = x.unsqueeze(-1)
+        print(f"Debug - Final output shape: {x.shape}")
         
         return x
 
@@ -76,4 +81,4 @@ class TwoLayerGAT(MultiLayerGAT):
         dropout (float): Dropout probability (default: 0.0)
     """
     def __init__(self, in_channels, hidden_channels, out_channels, heads=2, edge_dim=None, dropout=0.0):
-        super().__init__(in_channels, hidden_channels, out_channels, heads=heads, edge_dim=edge_dim, num_layers=2, dropout=dropout)
+        super().__init__(in_channels, hidden_channels, out_channels, num_layers=2, dropout=dropout)

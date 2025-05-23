@@ -2,7 +2,7 @@ import torch
 import json
 import sys
 from train import train_model
-from gcn_model import TwoLayerGCN
+from gcn import TwoLayerGCN
 from data_processor import GraphDataProcessor
 
 def load_custom_data(json_file):
