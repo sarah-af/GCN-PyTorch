@@ -1,5 +1,6 @@
 import torch
 from torch_geometric.nn import GCNConv, global_mean_pool
+import torch.nn.functional as F
 
 class MultiLayerGCN(torch.nn.Module):
     """
@@ -31,35 +32,55 @@ class MultiLayerGCN(torch.nn.Module):
         
         self.dropout = torch.nn.Dropout(dropout)
         
-    def forward(self, x, edge_index, batch=None):
+    def forward(self, x, edge_index, edge_attr=None, batch=None):
         """
         
         Args:
             x (torch.Tensor): Node feature matrix
             edge_index (torch.Tensor): Graph connectivity in COO format
+            edge_attr (torch.Tensor, optional): Edge features
             batch (torch.Tensor, optional): Batch assignment for each node
             
         Returns:
-            torch.Tensor: Graph-level predictions
+            torch.Tensor: Graph-level predictions of shape [batch_size]
         """
-        # Apply all layers except the last one with ReLU and dropout
-        for layer in self.layers[:-1]:
-            x = layer(x, edge_index)
-            x = torch.relu(x)
-            x = self.dropout(x)
+        # Process through GCN layers
+        for i, layer in enumerate(self.layers):
+            x = layer(x, edge_index, edge_attr)
+            if i < len(self.layers) - 1:  # Don't apply dropout after last layer
+                x = F.relu(x)
+                x = F.dropout(x, p=self.dropout, training=self.training)
         
-        # Last layer
-        x = self.layers[-1](x, edge_index)
+        # Get predictions for each graph
+        if batch is not None:
+            # Get unique graph indices
+            graph_indices = torch.unique(batch)
+            num_graphs = len(graph_indices)
+            
+            # Initialize output tensor
+            out = torch.zeros(num_graphs, device=x.device)
+            
+            # Process each graph separately
+            for i, graph_idx in enumerate(graph_indices):
+                # Get nodes for this graph
+                mask = batch == graph_idx
+                graph_x = x[mask]
+                
+                # Get prediction for this graph
+                graph_pred = self.pred(graph_x.mean(dim=0, keepdim=True))
+                out[i] = graph_pred.squeeze(-1)
+            
+            # Ensure output has shape [batch_size]
+            if out.dim() == 1 and out.size(0) == 1:
+                out = out.expand(num_graphs)
+        else:
+            # Single graph case
+            out = self.pred(x.mean(dim=0, keepdim=True))
+            out = out.squeeze(-1)
+            if out.dim() == 0:  # If we got a scalar, make it [1]
+                out = out.unsqueeze(0)
         
-        # Global pooling 
-        if batch is None:
-            batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
-        x = global_mean_pool(x, batch)
-        
-        # Final prediction
-        x = self.pred(x)
-        
-        return x
+        return out
 
 # For backward compatibility
 class TwoLayerGCN(MultiLayerGCN):

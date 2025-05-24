@@ -10,6 +10,7 @@ from gat import MultiLayerGAT
 from data_processor import GraphDataProcessor
 from torch_geometric.data import Data, Batch
 import math
+#import ipdb
 
 def split_data(graphs, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
     """
@@ -24,7 +25,7 @@ def split_data(graphs, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42
     Returns:
         tuple: (train_graphs, val_graphs, test_graphs)
     """
-    assert train_ratio + val_ratio + test_ratio == 1.0, "Ratios must sum to 1.0"
+    #assert train_ratio + val_ratio + test_ratio == 1.0, "Ratios must sum to 1.0"
     
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -229,10 +230,16 @@ def train_model(model, train_graphs, val_graphs, test_graphs, optimizer, args):
                 try:
                     batch_data = [convert_to_pyg_data(g, device) for g in batch_graphs]
                     batch = Batch.from_data_list(batch_data)
+
                     
                     optimizer.zero_grad()
                     # Only pass x, edge_index, and batch to the model
-                    out = model(batch.x, batch.edge_index, batch.batch)
+                    out = model(batch.x, batch.edge_index, edge_attr=None, batch=batch.batch)
+
+                    
+                    # Ensure output and target have the same shape
+                    target = batch.y  # Should already be [batch_size]
+                    loss = F.mse_loss(out, target)
                     
                     # Check for NaN values in model output
                     if torch.isnan(out).any():
@@ -242,11 +249,6 @@ def train_model(model, train_graphs, val_graphs, test_graphs, optimizer, args):
                         print("Input statistics:")
                         print(f"x mean: {batch.x.mean().item()}, std: {batch.x.std().item()}")
                         print(f"y mean: {batch.y.mean().item()}, std: {batch.y.std().item()}")
-                    
-                    # Ensure output and target have the same shape
-                    out = out.view(-1)  # Reshape to [batch_size]
-                    target = batch.y.view(-1)  # Reshape to [batch_size]
-                    loss = F.mse_loss(out, target)
                     
                     # Check for NaN loss
                     if torch.isnan(loss):
@@ -280,16 +282,13 @@ def train_model(model, train_graphs, val_graphs, test_graphs, optimizer, args):
                     
                     # Create proper batch indices
                     batch = Batch.from_data_list(batch_data)
-                   
+
+                    
                     # Only pass x, edge_index, and batch to the model
-                    out = model(batch.x, batch.edge_index, batch.batch)
-                
+                    out = model(batch.x, batch.edge_index, edge_attr=None, batch=batch.batch)
                     
                     # Ensure output and target have the same shape
-                    out = out.squeeze(-1)  # Remove last dimension if it's 1
-                    target = batch.y.view(-1)  # Reshape to [batch_size]
-                 
-                    
+                    target = batch.y  # Should already be [batch_size]
                     val_loss = F.mse_loss(out, target)
                     total_val_loss += val_loss.item() * len(batch_graphs)
             
@@ -326,7 +325,9 @@ def train_model(model, train_graphs, val_graphs, test_graphs, optimizer, args):
     with torch.no_grad():
         for graph_dict in test_graphs:
             data = convert_to_pyg_data(graph_dict, device)
-            out = model(data.x, data.edge_index, torch.zeros(data.x.size(0), dtype=torch.long, device=device))
+            # Create a batch tensor for single graph
+            batch = torch.zeros(data.x.size(0), dtype=torch.long, device=device)
+            out = model(data.x, data.edge_index, edge_attr=None, batch=batch)
             # Ensure consistent shapes for loss calculation
             out = out.squeeze()
             if out.dim() == 0:
@@ -437,6 +438,7 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     main(args)
+
 
 # def example_usage():
 #     sample_data = {

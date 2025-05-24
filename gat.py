@@ -28,7 +28,7 @@ class MultiLayerGAT(torch.nn.Module):
         
         # Output layer
         self.layers.append(GATConv(hidden_channels, out_channels, add_self_loops=False))
-        
+        self.pred = torch.nn.Linear(out_channels, 1)
         self.dropout = dropout
     
     def forward(self, x, edge_index, edge_attr=None, batch=None):
@@ -41,33 +41,46 @@ class MultiLayerGAT(torch.nn.Module):
             batch (torch.Tensor, optional): Batch assignment for each node
             
         Returns:
-            torch.Tensor: Graph-level predictions
+            torch.Tensor: Graph-level predictions of shape [batch_size]
         """
-        # If no batch is provided, create one
-        if batch is None:
-            batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
         
-        print(f"Debug - Input x shape: {x.shape}")
-        print(f"Debug - Batch shape: {batch.shape}")
-        print(f"Debug - Batch unique values: {torch.unique(batch)}")
-        
+        # Process through GAT layers
         for i, layer in enumerate(self.layers):
             x = layer(x, edge_index, edge_attr)
-            print(f"Debug - After layer {i}, x shape: {x.shape}")
             if i < len(self.layers) - 1:  # Don't apply dropout after last layer
                 x = F.relu(x)
                 x = F.dropout(x, p=self.dropout, training=self.training)
         
-        # Global mean pooling to get one prediction per graph
-        x = scatter_mean(x, batch, dim=0)
-        print(f"Debug - After scatter_mean, x shape: {x.shape}")
+        # Get predictions for each graph
+        if batch is not None:
+            # Get unique graph indices
+            graph_indices = torch.unique(batch)
+            num_graphs = len(graph_indices)
+            
+            # Initialize output tensor
+            out = torch.zeros(num_graphs, device=x.device)
+            
+            # Process each graph separately
+            for i, graph_idx in enumerate(graph_indices):
+                # Get nodes for this graph
+                mask = batch == graph_idx
+                graph_x = x[mask]
+                
+                # Get prediction for this graph
+                graph_pred = self.pred(graph_x.mean(dim=0, keepdim=True))
+                out[i] = graph_pred.squeeze(-1)
+            
+            # Ensure output has shape [batch_size]
+            if out.dim() == 1 and out.size(0) == 1:
+                out = out.expand(num_graphs)
+        else:
+            # Single graph case
+            out = self.pred(x.mean(dim=0, keepdim=True))
+            out = out.squeeze(-1)
+            if out.dim() == 0:  # If we got a scalar, make it [1]
+                out = out.unsqueeze(0)
         
-        # Ensure output has shape [batch_size, 1]
-        if x.dim() == 1:
-            x = x.unsqueeze(-1)
-        print(f"Debug - Final output shape: {x.shape}")
-        
-        return x
+        return out
 
 class TwoLayerGAT(MultiLayerGAT):
     """
